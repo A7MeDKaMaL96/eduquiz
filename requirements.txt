@@ -1,0 +1,11 @@
+# --- existing dependencies (unchanged) ---
+pdfplumber
+pdfminer.six
+
+# --- new: required for gemini_question_extractor.py ---
+requests
+flask
+gunicorn
+requests
+pdfplumber
+pdfminer.six
