@@ -38,12 +38,20 @@ USAGE
   python gemini_question_extractor.py <file_path>
 
 OUTPUT: single line of JSON on stdout. Diagnostics go to stderr only.
+
+NOTE ON gemini_client.py
+API-key resolution and the raw Gemini HTTP call now live in gemini_client.py
+so they can be shared with the AI Assistant (chat + lesson plan generator).
+Everything specific to question extraction - the prompts, the response
+schema, batching, salvage-on-truncation, normalization - stays in this
+file, unchanged.
 """
 import sys
 import os
 import io
 import json
 import re
+import time
 
 if __name__ == "__main__":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
@@ -55,36 +63,9 @@ except Exception as _import_err:
     MCQExtractor = None
     print(f"[gemini_extractor] could not import pdf_extract.py: {_import_err}", file=sys.stderr)
 
-GEMINI_MODEL = "gemini-2.5-flash"
-GEMINI_TIMEOUT_SECONDS = 60
-GEMINI_API_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-)
+from gemini_client import get_api_key, call_gemini_raw
 
 MAX_BATCH_CHARS = 4500  # keeps each request's output well under the model's token budget
-
-
-def load_env_file():
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    if not os.path.exists(env_path):
-        return
-    try:
-        with open(env_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                key, value = key.strip(), value.strip().strip('"').strip("'")
-                if key and key not in os.environ:
-                    os.environ[key] = value
-    except Exception as e:
-        print(f"[gemini_extractor] failed to read .env: {e}", file=sys.stderr)
-
-
-def get_api_key():
-    load_env_file()
-    return os.environ.get("GEMINI_API_KEY")
 
 
 def extract_raw_text(path: str) -> str:
@@ -240,9 +221,6 @@ RESPONSE_SCHEMA = {
 }
 
 
-import time
-
-
 def salvage_partial_json(text_out: str) -> dict:
     """If the model's output got truncated mid-array, recover whatever complete
     {...} question objects appear before the cut-off point instead of losing
@@ -268,61 +246,27 @@ def salvage_partial_json(text_out: str) -> dict:
 
 
 def call_gemini(api_key: str, prompt_text: str, max_retries: int = 4) -> dict:
-    import requests
-
-    body = {
-        "contents": [{"parts": [{"text": prompt_text}]}],
-        "generationConfig": {
-            "temperature": 0,
-            "response_mime_type": "application/json",
-            "response_schema": RESPONSE_SCHEMA,
-            "maxOutputTokens": 16384,
-            "thinkingConfig": {"thinkingBudget": 0},
-        },
+    """Extraction-specific wrapper around the shared client: forces JSON
+    output against RESPONSE_SCHEMA, then parses (or salvages) the result.
+    Behavior is identical to the pre-refactor version of this function."""
+    generation_config = {
+        "temperature": 0,
+        "response_mime_type": "application/json",
+        "response_schema": RESPONSE_SCHEMA,
+        "maxOutputTokens": 16384,
+        "thinkingConfig": {"thinkingBudget": 0},
     }
 
-    delay = 5
-    last_err = None
-    for attempt in range(max_retries):
-        try:
-            resp = requests.post(GEMINI_API_URL, params={"key": api_key}, json=body, timeout=GEMINI_TIMEOUT_SECONDS)
-            if resp.status_code == 429:
-                retry_after = resp.headers.get("Retry-After")
-                wait = float(retry_after) if retry_after else delay
-                print(f"[gemini_extractor] 429 rate limited, retrying in {wait:.0f}s "
-                      f"(attempt {attempt + 1}/{max_retries})", file=sys.stderr)
-                time.sleep(wait)
-                delay *= 2
-                continue
-            resp.raise_for_status()
-            data = resp.json()
-            text_out = data["candidates"][0]["content"]["parts"][0]["text"]
-            print(f"[gemini_extractor] batch raw output ({len(text_out)} chars): {text_out[:1500]}", file=sys.stderr)
-            try:
-                return json.loads(text_out)
-            except json.JSONDecodeError as je:
-                salvaged = salvage_partial_json(text_out)
-                print(f"[gemini_extractor] JSON truncated ({je}), salvaged "
-                      f"{len(salvaged['questions'])} complete item(s) from this batch", file=sys.stderr)
-                return salvaged
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            last_err = e
-            if attempt < max_retries - 1:
-                print(f"[gemini_extractor] network error ({e.__class__.__name__}), retrying in {delay}s "
-                      f"(attempt {attempt + 1}/{max_retries})", file=sys.stderr)
-                time.sleep(delay)
-                delay *= 2
-                continue
-            raise
-        except Exception as e:
-            last_err = e
-            if attempt < max_retries - 1 and "429" in str(e):
-                time.sleep(delay)
-                delay *= 2
-                continue
-            raise
+    text_out = call_gemini_raw(api_key, prompt_text, generation_config=generation_config, max_retries=max_retries)
+    print(f"[gemini_extractor] batch raw output ({len(text_out)} chars): {text_out[:1500]}", file=sys.stderr)
 
-    raise last_err if last_err else RuntimeError("Gemini call failed after retries")
+    try:
+        return json.loads(text_out)
+    except json.JSONDecodeError as je:
+        salvaged = salvage_partial_json(text_out)
+        print(f"[gemini_extractor] JSON truncated ({je}), salvaged "
+              f"{len(salvaged['questions'])} complete item(s) from this batch", file=sys.stderr)
+        return salvaged
 
 
 def _norm_type(value) -> str:
