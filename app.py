@@ -1,13 +1,16 @@
 """
-app.py — Flask wrapper around gemini_question_extractor.py
+app.py — Flask wrapper around gemini_question_extractor.py, ai_chat.py, and
+ai_lesson_plan.py
 
 This file does NOT change your existing extraction logic at all. It just
 gives that logic a "front door" that can answer web requests, instead of
 only working when you type a command in a terminal.
 
-Two web addresses (routes) this creates:
-  GET  /health   -> just says "I'm alive", used to check the service is up
-  POST /extract  -> the real one: send it a file, get back questions
+Web addresses (routes) this creates:
+  GET  /health         -> just says "I'm alive", used to check the service is up
+  POST /extract         -> send it a file, get back questions
+  POST /ai/chat          -> AI Assistant general chat (teacher/student/admin)
+  POST /ai/lesson-plan     -> AI Assistant lesson plan generator (teacher)
 
 HOW TO RUN THIS ON YOUR OWN COMPUTER (before we put it on the internet):
   python app.py
@@ -33,7 +36,29 @@ from gemini_question_extractor import (
 )
 import time
 
+# AI Assistant feature modules (new)
+from ai_chat import handle_chat_request, ChatValidationError
+from ai_lesson_plan import handle_lesson_plan_request, LessonPlanValidationError
+
 app = Flask(__name__)
+
+# Shared secret used to verify requests are coming from the PHP LMS backend,
+# not directly from a browser. Set AI_SERVICE_SECRET in services/.env and
+# in the LMS's config.php - PHP sends it as the X-Service-Secret header on
+# every /ai/* request. This does not replace the Gemini API key protection;
+# it prevents the /ai/* endpoints from being called by anyone who merely
+# discovers this service's URL.
+AI_SERVICE_SECRET = os.environ.get("AI_SERVICE_SECRET")
+
+
+def _check_service_secret():
+    """Returns True if the request carries the correct shared secret, or if
+    no secret is configured (local dev). In production, always set
+    AI_SERVICE_SECRET so this check is enforced."""
+    if not AI_SERVICE_SECRET:
+        return True
+    provided = request.headers.get("X-Service-Secret")
+    return provided == AI_SERVICE_SECRET
 
 
 @app.route("/health", methods=["GET"])
@@ -106,6 +131,75 @@ def extract():
             os.remove(temp_path)
         except OSError:
             pass
+
+
+@app.route("/ai/chat", methods=["POST"])
+def ai_chat():
+    """
+    AI Assistant - General Chat.
+
+    Expects JSON body:
+      {
+        "role": "teacher" | "student" | "admin",
+        "message": "string",
+        "history": [ {"sender": "user"|"assistant", "content": "string"}, ... ]  (optional)
+      }
+
+    Returns:
+      200 {"success": true, "reply": "string"}
+      400 {"success": false, "error": "validation message"}
+      401 {"success": false, "error": "Unauthorized"}
+      500 {"success": false, "error": "AI service temporarily unavailable"}
+    """
+    if not _check_service_secret():
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+
+    body = request.get_json(silent=True)
+    if not body:
+        return jsonify({"success": False, "error": "Invalid or missing JSON body"}), 400
+
+    try:
+        result = handle_chat_request(
+            role=body.get("role", ""),
+            message=body.get("message", ""),
+            history=body.get("history") or [],
+        )
+    except ChatValidationError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+
+    status_code = 200 if result.get("success") else 500
+    return jsonify(result), status_code
+
+
+@app.route("/ai/lesson-plan", methods=["POST"])
+def ai_lesson_plan():
+    """
+    AI Assistant - Lesson Plan Generator (Teacher only; role enforcement
+    also happens on the PHP side before this is ever called).
+
+    Expects JSON body: the full structured form data (see
+    ai_lesson_plan.REQUIRED_FIELDS / OPTIONAL_FIELDS for the exact keys).
+
+    Returns:
+      200 {"success": true, "content": "string"}
+      400 {"success": false, "error": "validation message"}
+      401 {"success": false, "error": "Unauthorized"}
+      500 {"success": false, "error": "AI service temporarily unavailable"}
+    """
+    if not _check_service_secret():
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+
+    body = request.get_json(silent=True)
+    if not body:
+        return jsonify({"success": False, "error": "Invalid or missing JSON body"}), 400
+
+    try:
+        result = handle_lesson_plan_request(body)
+    except LessonPlanValidationError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+
+    status_code = 200 if result.get("success") else 500
+    return jsonify(result), status_code
 
 
 if __name__ == "__main__":
